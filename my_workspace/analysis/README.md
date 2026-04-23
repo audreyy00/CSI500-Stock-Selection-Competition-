@@ -1,27 +1,22 @@
 # Factor Analysis
 
-`factor_effectiveness.py` runs four diagnostics on current factors:
+`factor_effectiveness.py` now runs only one method:
 
-1. Univariate Fama-MacBeth-style daily cross-sectional regression.
-2. IC / Rank IC / IR analysis.
-3. Quantile grouping backtest and long-short diagnostics.
-4. Orthogonalized Rank IC diagnostics.
+- Univariate Fama-MacBeth-style daily cross-sectional regression (t-value method).
+
+Single-factor output keeps only two indicators per factor:
+
+1. `factor_return_mean` (mean beta, i.e. factor return)
+2. `t_value` (Fama-MacBeth t-stat of mean beta)
 
 ## Run
 
 ```bash
 python my_workspace/analysis/factor_effectiveness.py \
   --prices data/prices.parquet \
-  --outdir my_workspace/results/factor_analysis \
-  --groups 10
+  --outdir my_workspace/results/factor_analysis
 ```
 
 ## Outputs
 
-- `factor_summary.csv`
-- `fama_macbeth_univariate.csv`
-- `ic_ir.csv`
-- `grouping_backtest.csv`
-- `orthogonalized_rank_ic.csv`
-- `factor_spearman_corr.csv`
-- `factor_keep_suggestion.csv`
+- `single_factor_tvalue.csv`

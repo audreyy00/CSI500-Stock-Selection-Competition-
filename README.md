@@ -185,7 +185,7 @@ python download_data.py --update --end 20260510
 
 ## Data
 
-`download_data.py` writes three files under `./data/`:
+`download_data.py` writes four files under `./data/`:
 
 - **`constituents.csv`** — current CSI500 members (`stock_code`, `stock_name`, `as_of_date`).
 - **`prices.parquet`** — daily bars per constituent. Columns: `date`,
@@ -194,6 +194,11 @@ python download_data.py --update --end 20260510
   `turnover` is a **fraction in [0, 1]** (not a percentage); `pct_change` is
   in **percent**.
 - **`index.parquet`** — daily bars for the CSI500 index itself (the benchmark).
+- **`industry.csv`** — stock-to-industry snapshot (`stock_code`, `stock_name`, `industry`).
+
+`constituents.csv` is also enriched with an `industry` column when available.
+If the upstream akshare snapshot schema changes or the field is unavailable,
+industry values may be empty while the rest of the pipeline still runs.
 
 Note: `constituents.csv` is filtered at the end of `download_data.py` to
 include only codes whose price data was fetched successfully. If a new CSI500

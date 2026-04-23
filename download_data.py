@@ -41,6 +41,39 @@ def fetch_constituents() -> pd.DataFrame:
     return df[["stock_code", "stock_name", "as_of_date"]]
 
 
+def fetch_industry_map() -> pd.DataFrame:
+    """
+    Try to fetch per-stock industry labels from Eastmoney snapshot via akshare.
+
+    Returns a DataFrame with columns:
+      - stock_code
+      - industry
+
+    If industry cannot be fetched (schema/network changes), returns empty DataFrame.
+    """
+    try:
+        spot = ak.stock_zh_a_spot_em()
+    except Exception as e:
+        print(f">> [warn] industry fetch failed: {e}")
+        return pd.DataFrame(columns=["stock_code", "industry"])
+
+    # Robust column detection across akshare schema variants.
+    code_candidates = ["代码", "股票代码", "stock_code", "symbol"]
+    industry_candidates = ["所处行业", "所属行业", "行业", "industry"]
+    code_col = next((c for c in code_candidates if c in spot.columns), None)
+    industry_col = next((c for c in industry_candidates if c in spot.columns), None)
+    if code_col is None or industry_col is None:
+        print(">> [warn] industry columns not found in stock_zh_a_spot_em output.")
+        return pd.DataFrame(columns=["stock_code", "industry"])
+
+    out = spot[[code_col, industry_col]].copy()
+    out = out.rename(columns={code_col: "stock_code", industry_col: "industry"})
+    out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
+    out["industry"] = out["industry"].astype(str).replace({"nan": pd.NA, "None": pd.NA})
+    out = out.drop_duplicates(subset=["stock_code"], keep="last")
+    return out[["stock_code", "industry"]]
+
+
 def _exchange_prefix(code: str) -> str:
     # A-share listing: 6xx-xxx on SSE (Shanghai), everything else on SZSE.
     return "sh" if code.startswith("6") else "sz"
@@ -106,6 +139,15 @@ def main():
     # Always refresh the constituent list and the benchmark index.
     print(">> Fetching CSI500 constituents...")
     cons = fetch_constituents()
+    print(">> Fetching stock industry snapshot...")
+    industry_map = fetch_industry_map()
+    if not industry_map.empty:
+        cons = cons.merge(industry_map, on="stock_code", how="left")
+        covered = int(cons["industry"].notna().sum())
+        print(f"   industry coverage: {covered}/{len(cons)}")
+    else:
+        cons["industry"] = pd.NA
+        print("   industry coverage: 0 (field unavailable; continuing without it)")
     # constituents.csv is written at the end, filtered to stocks whose price
     # data actually came through. Stash the full list here for iteration.
     print(f"   {len(cons)} constituents from CSI500 index.")
@@ -169,10 +211,12 @@ def main():
     final_codes = set(prices["stock_code"].unique())
     filtered = cons[cons["stock_code"].isin(final_codes)].reset_index(drop=True)
     filtered.to_csv(DATA_DIR / "constituents.csv", index=False)
+    filtered[["stock_code", "stock_name", "industry"]].to_csv(DATA_DIR / "industry.csv", index=False)
 
     print(f">> Saved {len(prices):,} rows across {len(final_codes)} stocks to data/prices.parquet")
     print(f"   success: {len(ok_codes)}, failed: {n_fail}")
     print(f">> Saved {len(filtered)} constituents to data/constituents.csv (filtered to downloaded)")
+    print(">> Saved industry labels to data/industry.csv")
     if n_fail:
         missing = sorted(set(codes) - final_codes)[:10]
         print(f"   dropped from universe (no price data): {missing}{'...' if n_fail > 10 else ''}")
