@@ -7,13 +7,13 @@ the course baseline files in the repository root intact.
 
 - `models/`: model scripts owned by you.
 - `experiments/`: experiment configs and notes.
-- `results/submissions/`: generated CSV files for upload.
+- `results/outputs/`: generated CSV files for upload.
 - `results/logs/`: run logs and metric snapshots.
 
 ## Current Baseline Snapshot
 
 - Baseline script copy: `models/baseline_xgboost_reference.py`
-- Week 1 baseline submission: `results/submissions/week1_baseline.csv`
+- Week 1 baseline submission: `results/outputs/week1_baseline.csv`
 
 ## Iteration Workflow (Cursor + Kaggle)
 
