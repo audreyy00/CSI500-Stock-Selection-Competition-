@@ -9,59 +9,81 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# columns used downstream by the baseline
+# columns used downstream by the model
+# 动量因子（基于图表111提到的13个因子）
 FEATURE_COLUMNS = [
-    "ret_1d", "ret_5d", "ret_10d", "ret_20d", "ret_60d",
-    "vol_20d", "volume_z_20d", "turnover_ma_20d",
-    "close_over_ma20", "close_over_ma60", "rsi_14",
-    "ret_5d_rank", "ret_20d_rank", "vol_20d_rank",
+    "HAlpha",
+    "return_1m", "return_3m", "return_6m", "return_12m",
+    "wgt_return_1m", "wgt_return_3m", "wgt_return_6m", "wgt_return_12m",
+    "exp_wgt_return_1m", "exp_wgt_return_3m", "exp_wgt_return_6m", "exp_wgt_return_12m",
 ]
 TARGET_COLUMN = "target_5d"
 FORWARD_HORIZON = 5
 
+LOOKBACK = {
+    "1m": 21,
+    "3m": 63,
+    "6m": 126,
+    "12m": 252,
+}
+
 
 def _per_stock_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Features that only depend on a single stock's time series."""
+    """Momentum-focused features computed from one stock's time series."""
     df = df.sort_values("date").copy()
     close = df["close"]
+    ret_1d = close.pct_change(1)
+    df["ret_1d"] = ret_1d
 
-    df["ret_1d"] = close.pct_change(1)
-    df["ret_5d"] = close.pct_change(5)
-    df["ret_10d"] = close.pct_change(10)
-    df["ret_20d"] = close.pct_change(20)
-    df["ret_60d"] = close.pct_change(60)
+    # 传统N个月动量因子: return_Nm
+    df["return_1m"] = close.pct_change(LOOKBACK["1m"])
+    df["return_3m"] = close.pct_change(LOOKBACK["3m"])
+    df["return_6m"] = close.pct_change(LOOKBACK["6m"])
+    df["return_12m"] = close.pct_change(LOOKBACK["12m"])
 
-    df["vol_20d"] = df["ret_1d"].rolling(20).std()
+    turnover = df["turnover"].astype(float) if "turnover" in df.columns else pd.Series(np.nan, index=df.index)
+    weighted_daily_ret = ret_1d * turnover
 
-    vol = df["volume"].astype(float)
-    vol_mean = vol.rolling(20).mean()
-    vol_std = vol.rolling(20).std().replace(0, np.nan)
-    df["volume_z_20d"] = (vol - vol_mean) / vol_std
+    # 换手率加权N个月动量: wgt_return_Nm
+    for tag, window in LOOKBACK.items():
+        num = weighted_daily_ret.rolling(window).sum()
+        den = turnover.rolling(window).sum().replace(0, np.nan)
+        df[f"wgt_return_{tag}"] = num / den
 
-    if "turnover" in df.columns:
-        df["turnover_ma_20d"] = df["turnover"].astype(float).rolling(20).mean()
-    else:
-        df["turnover_ma_20d"] = np.nan
-
-    df["close_over_ma20"] = close / close.rolling(20).mean() - 1.0
-    df["close_over_ma60"] = close / close.rolling(60).mean() - 1.0
-
-    delta = close.diff()
-    up = delta.clip(lower=0).rolling(14).mean()
-    down = (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan)
-    rs = up / down
-    df["rsi_14"] = 100 - 100 / (1 + rs)
+    # 指数衰减换手率加权N个月动量: exp_wgt_return_Nm
+    for tag, window in LOOKBACK.items():
+        ewm_num = weighted_daily_ret.ewm(span=window, adjust=False, min_periods=window).mean()
+        ewm_den = turnover.ewm(span=window, adjust=False, min_periods=window).mean().replace(0, np.nan)
+        df[f"exp_wgt_return_{tag}"] = ewm_num / ewm_den
 
     df[TARGET_COLUMN] = close.shift(-FORWARD_HORIZON) / close - 1.0
     return df
 
 
-def _cross_sectional_ranks(panel: pd.DataFrame) -> pd.DataFrame:
-    """Daily cross-sectional rank of selected features (values in [0, 1])."""
-    for base in ["ret_5d", "ret_20d", "vol_20d"]:
-        panel[f"{base}_rank"] = (
-            panel.groupby("date")[base].rank(method="average", pct=True)
-        )
+def _add_halpha(panel: pd.DataFrame, window: int = 252) -> pd.DataFrame:
+    """
+    Add HAlpha-like factor from rolling CAPM alpha:
+      alpha_t = mean(r_i) - beta_t * mean(r_m)
+    where beta_t = cov(r_i, r_m) / var(r_m) over rolling window.
+
+    Note:
+    - Original report uses very long horizon (60 months). With current daily
+      sample length, we approximate using 252 trading days.
+    """
+    panel = panel.sort_values(["stock_code", "date"]).copy()
+    panel["market_ret"] = panel.groupby("date")["ret_1d"].transform("mean")
+
+    def _calc_alpha(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.sort_values("date").copy()
+        ri = g["ret_1d"]
+        rm = g["market_ret"]
+        cov = ri.rolling(window).cov(rm)
+        var = rm.rolling(window).var().replace(0, np.nan)
+        beta = cov / var
+        g["HAlpha"] = ri.rolling(window).mean() - beta * rm.rolling(window).mean()
+        return g
+
+    panel = panel.groupby("stock_code", group_keys=False).apply(_calc_alpha).reset_index(drop=True)
     return panel
 
 
@@ -79,7 +101,7 @@ def build_features(prices: pd.DataFrame) -> pd.DataFrame:
         .apply(_per_stock_features)
         .reset_index(drop=True)
     )
-    panel = _cross_sectional_ranks(panel)
+    panel = _add_halpha(panel, window=LOOKBACK["12m"])
     return panel
 
 
