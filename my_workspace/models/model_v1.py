@@ -310,11 +310,19 @@ def main():
         for i in range(args.backtest_windows)
         if latest_backtest_idx - i * args.hold_days >= 0
     ]
-    backtest_indices = sorted(backtest_indices)
+    # Keep most recent windows first; older windows are more likely to fail
+    # strict-history constraints after long-lookback feature expansion.
+    backtest_indices = sorted(backtest_indices, reverse=True)
     rows = []
+    skipped_windows = 0
     for idx in backtest_indices:
         bt_as_of = pd.Timestamp(trading_dates[idx])
-        bt_train_df, bt_val_df = _build_train_val(panel, bt_as_of, trading_dates)
+        try:
+            bt_train_df, bt_val_df = _build_train_val(panel, bt_as_of, trading_dates)
+        except RuntimeError as e:
+            skipped_windows += 1
+            print(f"   skip as_of={bt_as_of.date()} ({e})")
+            continue
         bt_model = train_model(bt_train_df, bt_val_df)
         bt_pred = bt_model.predict(bt_val_df[FEATURE_COLUMNS])
         bt_ic = rank_ic(bt_val_df[TARGET_COLUMN].to_numpy(), bt_pred, bt_val_df["date"].to_numpy())
@@ -343,6 +351,7 @@ def main():
         return
 
     bt = pd.DataFrame(rows)
+    bt = bt.sort_values("as_of").reset_index(drop=True)
     print(bt.to_string(index=False, float_format=lambda x: f"{x:+.4%}" if abs(x) < 2 else f"{x:.4f}"))
 
     metrics = performance_metrics(bt, hold_days=args.hold_days)
@@ -352,6 +361,8 @@ def main():
 
     print(">> Backtest summary")
     print(f"   windows: {len(bt)}")
+    if skipped_windows:
+        print(f"   skipped windows:              {skipped_windows}")
     print(f"   strategy cumulative return:  {metrics['strategy_cum_return']:+.3%}")
     print(f"   benchmark cumulative return: {metrics['benchmark_cum_return']:+.3%}")
     print(f"   cumulative excess return:    {metrics['cum_excess_return']:+.3%}")
