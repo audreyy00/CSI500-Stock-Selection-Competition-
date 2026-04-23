@@ -9,7 +9,9 @@ What is added compared with baseline_xgboost.py:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -108,11 +110,10 @@ def performance_metrics(bt: pd.DataFrame, hold_days: int) -> dict:
     rp = bt["portfolio_return"].astype(float)
     rb = bt["benchmark_return"].astype(float)
 
-    periods_per_year = 252.0 / max(1, hold_days)
     mean_rp = float(rp.mean())
     std_rp = float(rp.std(ddof=1))
-    vol_ann = std_rp * np.sqrt(periods_per_year) if std_rp > 0 else np.nan
-    sharpe = (mean_rp / std_rp) * np.sqrt(periods_per_year) if std_rp > 0 else np.nan
+    volatility = std_rp if std_rp > 0 else np.nan
+    sharpe = mean_rp / std_rp if std_rp > 0 else np.nan
 
     # Regression: rp = alpha + beta * rb + eps
     rb_var = float(rb.var(ddof=1))
@@ -122,7 +123,6 @@ def performance_metrics(bt: pd.DataFrame, hold_days: int) -> dict:
     else:
         beta = np.nan
         alpha_period = np.nan
-    alpha_ann = alpha_period * periods_per_year if not np.isnan(alpha_period) else np.nan
 
     cum_port = float((1.0 + rp).prod() - 1.0)
     cum_bench = float((1.0 + rb).prod() - 1.0)
@@ -132,12 +132,48 @@ def performance_metrics(bt: pd.DataFrame, hold_days: int) -> dict:
         "strategy_cum_return": cum_port,
         "benchmark_cum_return": cum_bench,
         "cum_excess_return": cum_excess,
-        "alpha_annualized": alpha_ann,
+        "alpha": alpha_period,
         "beta": beta,
-        "sharpe_annualized": sharpe,
-        "volatility_annualized": vol_ann,
+        "sharpe": sharpe,
+        "volatility": volatility,
         "max_drawdown": _max_drawdown(rp),
     }
+
+
+def _timestamped_output_path(out_path: Path) -> Path:
+    """Append timestamp and strip weekN_ prefix from filename stem."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clean_stem = re.sub(r"^week\d+_?", "", out_path.stem, flags=re.IGNORECASE)
+    clean_stem = clean_stem or "model_v1"
+    return out_path.with_name(f"{clean_stem}_{timestamp}{out_path.suffix}")
+
+
+def _load_industry_map(industry_file: str) -> pd.DataFrame:
+    path = Path(industry_file)
+    if not path.exists():
+        return pd.DataFrame(columns=["stock_code", "industry"])
+    ind = pd.read_csv(path, dtype={"stock_code": str})
+    if "stock_code" not in ind.columns:
+        return pd.DataFrame(columns=["stock_code", "industry"])
+    if "industry" not in ind.columns:
+        ind["industry"] = "UNKNOWN"
+    ind["stock_code"] = ind["stock_code"].astype(str).str.zfill(6)
+    ind["industry"] = ind["industry"].fillna("UNKNOWN").astype(str)
+    return ind[["stock_code", "industry"]].drop_duplicates(subset=["stock_code"])
+
+
+def _attach_industry_dummies(panel: pd.DataFrame, industry_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    if industry_df.empty:
+        return panel, []
+    out = panel.merge(industry_df, on="stock_code", how="left")
+    out["industry"] = out["industry"].fillna("UNKNOWN")
+    dummies = pd.get_dummies(out["industry"], prefix="ind", dtype=float)
+    if not dummies.empty:
+        # Drop one base column to avoid perfect collinearity in linear comparisons.
+        base_col = sorted(dummies.columns)[0]
+        dummies = dummies.drop(columns=[base_col])
+    out = pd.concat([out, dummies], axis=1)
+    return out, dummies.columns.tolist()
 
 
 def _resolve_as_of(panel: pd.DataFrame, as_of: str | None) -> tuple[pd.Timestamp, np.ndarray]:
@@ -177,7 +213,7 @@ def _build_train_val(panel: pd.DataFrame, as_of_ts: pd.Timestamp, trading_dates:
     return train_df, val_df
 
 
-def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame) -> xgb.XGBRegressor:
+def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame, feature_cols: list[str]) -> xgb.XGBRegressor:
     if ALLOW_CROSS_VALIDATION:
         raise RuntimeError("Cross-validation is disabled by design in model_v1.")
 
@@ -186,8 +222,8 @@ def train_model(train_df: pd.DataFrame, val_df: pd.DataFrame) -> xgb.XGBRegresso
         early_stopping_rounds=EARLY_STOPPING_ROUNDS,
     )
     model.fit(
-        train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN],
-        eval_set=[(val_df[FEATURE_COLUMNS], val_df[TARGET_COLUMN])],
+        train_df[feature_cols], train_df[TARGET_COLUMN],
+        eval_set=[(val_df[feature_cols], val_df[TARGET_COLUMN])],
         verbose=False,
     )
     return model
@@ -245,7 +281,9 @@ def main():
     p.add_argument("--index", default="data/index.parquet")
     p.add_argument("--as-of", default=None, help="YYYYMMDD; defaults to latest trading date in data")
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    p.add_argument("--out", default="submission.csv")
+    p.add_argument("--out", default="model_v1.csv")
+    p.add_argument("--industry-file", default="data/industry.csv")
+    p.add_argument("--use-industry-dummies", action="store_true")
     p.add_argument("--run-backtest", action="store_true", help="run strict walk-forward historical windows")
     p.add_argument("--backtest-windows", type=int, default=6, help="number of walk-forward windows to report")
     p.add_argument("--hold-days", type=int, default=DEFAULT_HOLD_DAYS, help="holding days per backtest window")
@@ -260,6 +298,14 @@ def main():
 
     print(">> Building features")
     panel = build_features(prices)
+    feature_cols = FEATURE_COLUMNS.copy()
+    if args.use_industry_dummies:
+        industry_df = _load_industry_map(args.industry_file)
+        panel, ind_cols = _attach_industry_dummies(panel, industry_df)
+        feature_cols.extend(ind_cols)
+        print(f"   industry dummies: {len(ind_cols)} columns")
+    else:
+        print("   industry dummies: disabled")
 
     as_of_ts, trading_dates = _resolve_as_of(panel, args.as_of)
     train_df, val_df = _build_train_val(panel, as_of_ts, trading_dates)
@@ -269,11 +315,12 @@ def main():
     print(f"   train: {len(train_df):,} rows up to {train_end.date()}")
     print(f"   embargo: {EMBARGO_DAYS} trading days (discarded)")
     print(f"   val:   {len(val_df):,} rows from {val_start.date()}")
+    print(f"   feature count: {len(feature_cols)}")
 
     print(">> Training XGBoost")
-    model = train_model(train_df, val_df)
+    model = train_model(train_df, val_df, feature_cols)
 
-    val_pred = model.predict(val_df[FEATURE_COLUMNS])
+    val_pred = model.predict(val_df[feature_cols])
     ic = rank_ic(val_df[TARGET_COLUMN].to_numpy(), val_pred, val_df["date"].to_numpy())
     print(f"   validation rank IC: {ic:.4f}")
 
@@ -284,11 +331,11 @@ def main():
     pred_date = pred_df["date"].iloc[0]
     print(f"   as of {pred_date.date()}, scoring {len(pred_df)} stocks")
 
-    pred_df = pred_df.assign(score=model.predict(pred_df[FEATURE_COLUMNS]))
+    pred_df = pred_df.assign(score=model.predict(pred_df[feature_cols]))
     scores = pred_df.set_index("stock_code")["score"]
     weights = build_portfolio(scores, top_k=args.top_k)
 
-    out_path = Path(args.out)
+    out_path = _timestamped_output_path(Path(args.out))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out = pd.DataFrame({"stock_code": weights.index, "weight": weights.values})
     out.to_csv(out_path, index=False)
@@ -323,14 +370,14 @@ def main():
             skipped_windows += 1
             print(f"   skip as_of={bt_as_of.date()} ({e})")
             continue
-        bt_model = train_model(bt_train_df, bt_val_df)
-        bt_pred = bt_model.predict(bt_val_df[FEATURE_COLUMNS])
+        bt_model = train_model(bt_train_df, bt_val_df, feature_cols)
+        bt_pred = bt_model.predict(bt_val_df[feature_cols])
         bt_ic = rank_ic(bt_val_df[TARGET_COLUMN].to_numpy(), bt_pred, bt_val_df["date"].to_numpy())
 
         bt_frame = prediction_frame(panel, as_of=bt_as_of)
         if bt_frame.empty:
             continue
-        bt_frame = bt_frame.assign(score=bt_model.predict(bt_frame[FEATURE_COLUMNS]))
+        bt_frame = bt_frame.assign(score=bt_model.predict(bt_frame[feature_cols]))
         bt_weights = build_portfolio(bt_frame.set_index("stock_code")["score"], top_k=args.top_k)
 
         start = pd.Timestamp(trading_dates[idx + 1])
@@ -366,10 +413,10 @@ def main():
     print(f"   strategy cumulative return:  {metrics['strategy_cum_return']:+.3%}")
     print(f"   benchmark cumulative return: {metrics['benchmark_cum_return']:+.3%}")
     print(f"   cumulative excess return:    {metrics['cum_excess_return']:+.3%}")
-    print(f"   alpha (annualized):          {metrics['alpha_annualized']:+.3%}")
+    print(f"   alpha:                       {metrics['alpha']:+.3%}")
     print(f"   beta:                        {metrics['beta']:+.4f}")
-    print(f"   sharpe (annualized):         {metrics['sharpe_annualized']:+.4f}")
-    print(f"   volatility (annualized):     {metrics['volatility_annualized']:+.3%}")
+    print(f"   sharpe:                      {metrics['sharpe']:+.4f}")
+    print(f"   volatility:                  {metrics['volatility']:+.3%}")
     print(f"   max drawdown:                {metrics['max_drawdown']:+.3%}")
     print(f"   metrics csv:                 {metrics_out}")
 
